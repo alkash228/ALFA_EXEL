@@ -497,13 +497,31 @@ def _field_strip(field: str) -> str:
 
 
 def polish_fields(fields: list[str]) -> list[str]:
-    """Поле из одних пробелов — не колонка. Настоящая пустота между разделителями остаётся."""
-    polished: list[str] = []
-    for field in fields:
-        if field != "" and _field_strip(field) == "":
+    """Пробел `' '` и невидимые пробелы по краям снимаются. Пустое поле `,,` остаётся пустым."""
+    return [_field_strip(field) for field in fields] or [""]
+
+
+def drop_extra_blanks(fields: list[str], width: int) -> list[str]:
+    """Лишняя пустота сразу после имени: «Имя,,дальше» или «Имя, ,дальше».
+
+    В части строк после имени стоит запятая и пробел, в остальных такого нет.
+    Пустая колонка сдвигает всё вправо — её надо выкинуть, если колонок стало больше нормы.
+    """
+    if width <= 0 or len(fields) <= width:
+        return fields
+    out = list(fields)
+    guard = 0
+    while len(out) > width and guard < 40:
+        guard += 1
+        # Сначала пустота сразу после первой колонки (имени).
+        if len(out) >= 2 and out[1] == "":
+            del out[1]
             continue
-        polished.append(_field_strip(field))
-    return polished or [""]
+        blank = next((index for index in range(1, len(out) - 1) if out[index] == ""), None)
+        if blank is None:
+            break
+        del out[blank]
+    return out
 
 
 def _number_merge_at(fields: list[str], delimiter: str) -> int | None:
@@ -521,6 +539,7 @@ def fit_width(fields: list[str], width: int, delimiter: str, stats: Stats) -> li
     fields = polish_fields(fields)
     if width <= 0:
         width = max(1, len(fields))
+    fields = drop_extra_blanks(fields, width)
     if len(fields) == width:
         return fields
     stats.ragged += 1
