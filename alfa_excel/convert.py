@@ -61,6 +61,7 @@ class Layout:
     sample: list[list[str]] = field(default_factory=list)
     allow_multiline_quotes: bool = False
     locked_columns: int = 0
+    drop_leading_blank: bool = False
 
 
 @dataclass
@@ -154,6 +155,7 @@ def describe_delimiter(value: str) -> str:
         ";": "точка с запятой",
         "|": "вертикальная черта",
         "\u00a0": "неразрывный пробел",
+        "  ": "несколько пробелов",
         "\r\n": "CRLF",
         "\n": "LF",
         "\r": "CR",
@@ -707,7 +709,7 @@ _INVISIBLE_NAMES = {
     "\u2060": "неразрывный знак нулевой ширины",
     "\u00ad": "мягкий перенос",
 }
-_SCAN_DELIMITERS = ("\t", ",", ";", "|", "\u00a0")
+_SCAN_DELIMITERS = ("\t", ",", ";", "|", "\u00a0", "  ")
 
 
 def normalize_text(text: str, *, keep_nbsp: bool = False) -> str:
@@ -761,19 +763,32 @@ class RowStream:
         return item
 
     def _clean_fields(self, fields: list[str]) -> list[str]:
-        if self.layout.delimiter == "\t" or not self.layout.delimiter:
-            return fields
+        # Пробел и невидимый пробел по краю ячейки — не значение. Иначе текст в Excel уезжает вправо.
         return [field.strip(" \t") for field in fields]
+
+    def _drop_indent_column(self, text: str, fields: list[str]) -> list[str]:
+        delimiter = self.layout.delimiter
+        if not delimiter or len(fields) < 2 or fields[0] != "":
+            return fields
+        if text.startswith(delimiter):
+            return fields
+        return fields[1:]
 
     def _split_record(self, text: str) -> tuple[list[str], bool]:
         delimiter = self.layout.delimiter
         qualifier = self.layout.qualifier
+        if delimiter == "  ":
+            body = text.strip(" ")
+            fields = [part.strip(" ") for part in re.split(r" {2,}", body)] if body else []
+            return self._clean_fields(fields), False
         if not qualifier:
-            return self._clean_fields(text.split(delimiter)), False
+            fields = self._drop_indent_column(text, self._clean_fields(text.split(delimiter)))
+            return fields, False
         fields, unclosed = parse_fields(text, delimiter, qualifier)
         if unclosed and not self.layout.allow_multiline_quotes:
-            return self._clean_fields(text.split(delimiter)), False
-        return self._clean_fields(fields), unclosed
+            fields = self._drop_indent_column(text, self._clean_fields(text.split(delimiter)))
+            return fields, False
+        return self._drop_indent_column(text, self._clean_fields(fields)), unclosed
 
     def _join_dash_line(self, first: str) -> str:
         parts = [first]
@@ -1260,7 +1275,12 @@ def analyze_file(
                 if len(sample_lines) < 12 and len(text) <= 4000:
                     sample_lines.append(text)
                 for delimiter, bucket in histogram.items():
-                    count = _quoted_mark(text, delimiter) if delimiter in {",", ";"} else text.count(delimiter)
+                    if delimiter == "  ":
+                        count = len(re.findall(r" {2,}", text))
+                    elif delimiter in {",", ";"}:
+                        count = _quoted_mark(text, delimiter)
+                    else:
+                        count = text.count(delimiter)
                     bucket[count] = bucket.get(count, 0) + 1
             previous = text[:4000]
     finally:
@@ -1306,7 +1326,8 @@ def analyze_file(
             qualifier = '"'
     notes.append(f"Режим: текст с разделителем ({describe_delimiter(delimiter)}).")
     if locked:
-        notes.append(f"Колонок по всему файлу: {locked}. Пустые поля сохраняются.")
+        notes.append(f"Колонок по всему файлу: {locked}. Пустые поля между разделителями сохраняются.")
+    notes.append("Пробел по краю ячейки снимается и не сдвигает строку вправо.")
     if qualifier:
         notes.append("Кавычки обрамляют поля." if not multiline else "Кавычки обрамляют поля, в том числе с переносом строки.")
 
@@ -1566,6 +1587,19 @@ def run_self_check() -> None:
             held.close()
         assert scan_rows[0] == ["1", "", "2"], scan_rows
         assert scan_rows[1] == ["3", "x", "4"], scan_rows
+        pad_path = os.path.join(directory, "pad.txt")
+        Path(pad_path).write_text("name\tage\n Ann\t10\n\t20\n1\t\n", encoding="utf-8")
+        pad_layout = analyze_file(pad_path, Settings(mode="delimited", delimiter="\t", header="yes"))
+        held_pad = Source(pad_path, "utf-8")
+        try:
+            pad_stream = RowStream(iter_lines(held_pad.text, 100000, Stats()), pad_layout, Settings(), Stats())
+            pad_stream.open()
+            pad_rows = list(pad_stream.rows())
+        finally:
+            held_pad.close()
+        assert pad_rows[0] == ["Ann", "10"], pad_rows
+        assert pad_rows[1] == ["", "20"], pad_rows
+        assert pad_rows[2] == ["1", ""], pad_rows
         source = os.path.join(directory, "dump.txt")
         output = os.path.join(directory, "dump.xlsx")
         with open(source, "w", encoding="utf-8", newline="") as handle:
