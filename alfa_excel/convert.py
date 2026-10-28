@@ -418,7 +418,7 @@ def slice_spans(line: str, spans: list[tuple[int, int | None]]) -> list[str]:
             fields.append("")
             continue
         piece = line[start:] if end is None else line[start:end]
-        fields.append(piece.strip(" \t"))
+        fields.append(piece.strip(_FIELD_EDGE))
     return fields
 
 
@@ -489,12 +489,50 @@ def parse_fields(text: str, delimiter: str, qualifier: str) -> tuple[list[str], 
     return fields, in_quote
 
 
+_FIELD_EDGE = " \t\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
+
+
+def _field_strip(field: str) -> str:
+    return field.strip(_FIELD_EDGE)
+
+
+def polish_fields(fields: list[str]) -> list[str]:
+    """Поле из одних пробелов — не колонка. Настоящая пустота между разделителями остаётся."""
+    polished: list[str] = []
+    for field in fields:
+        if field != "" and _field_strip(field) == "":
+            continue
+        polished.append(_field_strip(field))
+    return polished or [""]
+
+
+def _number_merge_at(fields: list[str], delimiter: str) -> int | None:
+    for index in range(len(fields) - 1):
+        left = fields[index]
+        right = fields[index + 1]
+        if delimiter == "," and re.fullmatch(r"-?\d+", left) and re.fullmatch(r"\d{1,4}", right):
+            return index
+        if delimiter in {" ", "  ", "\u00a0"} and re.fullmatch(r"\d{1,3}", left) and re.fullmatch(r"\d{3}", right):
+            return index
+    return None
+
+
 def fit_width(fields: list[str], width: int, delimiter: str, stats: Stats) -> list[str]:
+    fields = polish_fields(fields)
     if width <= 0:
         width = max(1, len(fields))
     if len(fields) == width:
         return fields
     stats.ragged += 1
+    guard = 0
+    while len(fields) > width and guard < 30:
+        guard += 1
+        merge_at = _number_merge_at(fields, delimiter)
+        if merge_at is None:
+            break
+        separator = "," if delimiter == "," else (" " if delimiter in {" ", "  ", "\u00a0"} else delimiter)
+        fields[merge_at] = f"{fields[merge_at]}{separator}{fields[merge_at + 1]}"
+        del fields[merge_at + 1]
     if len(fields) > width:
         if width == 1:
             return [delimiter.join(fields)]
@@ -763,8 +801,7 @@ class RowStream:
         return item
 
     def _clean_fields(self, fields: list[str]) -> list[str]:
-        # Пробел и невидимый пробел по краю ячейки — не значение. Иначе текст в Excel уезжает вправо.
-        return [field.strip(" \t") for field in fields]
+        return polish_fields(fields)
 
     def _drop_indent_column(self, text: str, fields: list[str]) -> list[str]:
         delimiter = self.layout.delimiter
@@ -1172,14 +1209,17 @@ def plan_folder(folder: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _quoted_mark(text: str, delimiter: str) -> int:
-    """Сколько разделителей снаружи кавычек. Запятая внутри поля не плодит колонку."""
-    if '"' not in text:
-        return text.count(delimiter)
-    fields, unclosed = parse_fields(text, delimiter, '"')
-    if unclosed:
-        return text.count(delimiter)
-    return max(0, len(fields) - 1)
+def _parts_for_count(text: str, delimiter: str) -> list[str]:
+    if delimiter == "  ":
+        body = text.strip(" ")
+        parts = re.split(r" {2,}", body) if body else []
+    elif delimiter in {",", ";"} and '"' in text:
+        parts, unclosed = parse_fields(text, delimiter, '"')
+        if unclosed:
+            parts = text.split(delimiter)
+    else:
+        parts = text.split(delimiter)
+    return polish_fields(parts)
 
 
 def _modal_split(counts: dict[int, int]) -> tuple[int, int, int]:
@@ -1275,12 +1315,7 @@ def analyze_file(
                 if len(sample_lines) < 12 and len(text) <= 4000:
                     sample_lines.append(text)
                 for delimiter, bucket in histogram.items():
-                    if delimiter == "  ":
-                        count = len(re.findall(r" {2,}", text))
-                    elif delimiter in {",", ";"}:
-                        count = _quoted_mark(text, delimiter)
-                    else:
-                        count = text.count(delimiter)
+                    count = max(0, len(_parts_for_count(text, delimiter)) - 1)
                     bucket[count] = bucket.get(count, 0) + 1
             previous = text[:4000]
     finally:
@@ -1315,6 +1350,18 @@ def analyze_file(
             locked = mode_count + 1
     elif fields:
         locked = fields
+    if settings.header != "no" and sample_lines and delimiter:
+        first_parts = _parts_for_count(sample_lines[0], delimiter)
+        second_parts = _parts_for_count(sample_lines[1], delimiter) if len(sample_lines) > 1 else []
+        if (
+            len(first_parts) >= 2
+            and second_parts
+            and len(first_parts) < len(second_parts) <= len(first_parts) + 4
+            and not any(_numeric_token(item) for item in first_parts if item)
+            and any(_numeric_token(item) for item in second_parts if item)
+        ):
+            locked = len(first_parts)
+            notes.append("Лишние куски в числах и пробелах собираются обратно в ячейку заголовка.")
 
     qualifier = settings.qualifier
     multiline = settings.mode == "csv"
@@ -1600,6 +1647,24 @@ def run_self_check() -> None:
         assert pad_rows[0] == ["Ann", "10"], pad_rows
         assert pad_rows[1] == ["", "20"], pad_rows
         assert pad_rows[2] == ["1", ""], pad_rows
+        money_path = os.path.join(directory, "money.csv")
+        Path(money_path).write_text("name,amount\nIvan,10,50\nAnna,3,5\n", encoding="utf-8")
+        money_layout = analyze_file(money_path, Settings(mode="auto", delimiter="auto", header="yes"))
+        assert money_layout.locked_columns == 2, money_layout.locked_columns
+        held_money = Source(money_path, "utf-8")
+        try:
+            money_stream = RowStream(
+                iter_lines(held_money.text, 100000, Stats()),
+                money_layout,
+                Settings(),
+                Stats(),
+            )
+            money_stream.open()
+            money_rows = list(money_stream.rows())
+        finally:
+            held_money.close()
+        assert money_rows[0] == ["Ivan", "10,50"], money_rows
+        assert money_rows[1] == ["Anna", "3,5"], money_rows
         source = os.path.join(directory, "dump.txt")
         output = os.path.join(directory, "dump.xlsx")
         with open(source, "w", encoding="utf-8", newline="") as handle:
