@@ -93,12 +93,94 @@ def _prepare_tcl() -> None:
 
 
 def _enable_dpi() -> None:
+    """Разный масштаб у мониторов: окно должно быть чётким на том экране, где его открыли."""
     try:
         import ctypes
 
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        awareness = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        awareness.argtypes = [ctypes.c_void_p]
+        awareness.restype = ctypes.c_bool
+        if awareness(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         return
+
+
+def _monitor_under_cursor() -> tuple[int, int, int, int, int]:
+    """Рабочая область и DPI монитора, на котором сейчас курсор."""
+    import ctypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", ctypes.c_ulong),
+        ]
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    user32 = ctypes.windll.user32
+    point = POINT()
+    user32.GetCursorPos(ctypes.byref(point))
+    monitor = user32.MonitorFromPoint(point, 2)
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise OSError("monitor")
+    dpi_x = ctypes.c_uint()
+    dpi_y = ctypes.c_uint()
+    ctypes.windll.shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y))
+    work = info.rcWork
+    return work.left, work.top, work.right, work.bottom, int(dpi_x.value or 96)
+
+
+def _monitor_of_window(hwnd: int) -> tuple[int, int, int, int, int]:
+    import ctypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", ctypes.c_ulong),
+        ]
+
+    user32 = ctypes.windll.user32
+    parent = user32.GetParent(hwnd) or hwnd
+    monitor = user32.MonitorFromWindow(parent, 2)
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise OSError("monitor")
+    dpi_x = ctypes.c_uint()
+    dpi_y = ctypes.c_uint()
+    ctypes.windll.shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y))
+    work = info.rcWork
+    return work.left, work.top, work.right, work.bottom, int(dpi_x.value or 96)
 
 
 def _format_int(value: int) -> str:
@@ -234,17 +316,115 @@ class App:
         _enable_dpi()
         self.root = tk.Tk()
         self.root.title("ALFA — TXT в Excel")
-        self.root.geometry("1180x860")
-        self.root.minsize(1020, 720)
         self.root.configure(bg=BG)
         self.queue: queue.Queue = queue.Queue()
         self.cancel = threading.Event()
         self.worker: threading.Thread | None = None
         self.closing = False
+        self._screen_key: tuple[int, int, int] | None = None
+        self._dpi = 96
+        self._fit_job: str | None = None
+        self._stacked: bool | None = None
+        self._hints: list[tk.Label] = []
+        self._apply_screen_scale()
         self._build_styles()
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Configure>", self._schedule_screen_sync)
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+        self.root.after(30, lambda: self._place_on_screen(follow_cursor=True))
         self.root.after(80, self._poll)
+
+    def _apply_screen_scale(self) -> None:
+        try:
+            _left, _top, _right, _bottom, dpi = _monitor_under_cursor()
+        except Exception:
+            dpi = 96
+        self._dpi = max(96, dpi)
+        self.root.tk.call("tk", "scaling", self._dpi / 72.0)
+
+    def _place_on_screen(self, follow_cursor: bool = False) -> None:
+        self.root.update_idletasks()
+        try:
+            if follow_cursor:
+                left, top, right, bottom, dpi = _monitor_under_cursor()
+            else:
+                left, top, right, bottom, dpi = _monitor_of_window(self.root.winfo_id())
+        except Exception:
+            left, top = 0, 0
+            right, bottom = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            dpi = self._dpi
+        self._adopt_dpi(dpi, bottom - top)
+        work_w = max(320, right - left)
+        work_h = max(240, bottom - top)
+        width = work_w - 24
+        height = work_h - 32
+        if work_w >= 1500:
+            width = min(width, int(work_w * 0.72))
+        if work_h >= 980:
+            height = min(height, int(work_h * 0.8))
+        width = max(320, min(width, work_w - 8))
+        height = max(240, min(height, work_h - 8))
+        x = left + max(0, (work_w - width) // 2)
+        y = top + max(0, (work_h - height) // 2)
+        self.root.minsize(min(640, width), min(420, height))
+        if self.root.state() != "zoomed":
+            self.root.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
+        self._screen_key = (left, top, self._dpi)
+        self._sync_scroll()
+
+    def _adopt_dpi(self, dpi: int, work_h: int) -> None:
+        dpi = max(96, dpi)
+        if dpi != self._dpi:
+            self._dpi = dpi
+            self.root.tk.call("tk", "scaling", self._dpi / 72.0)
+        self._fit_density(work_h)
+
+    def _fit_density(self, work_h: int) -> None:
+        compact = work_h < 860
+        if hasattr(self, "title_label"):
+            self.title_label.configure(font=("Segoe UI Semibold", 16 if compact else 22))
+        if hasattr(self, "log"):
+            self.log.configure(height=4 if compact else 6)
+        if hasattr(self, "tree"):
+            self.tree.configure(height=5 if compact else 7)
+
+    def _schedule_screen_sync(self, event: tk.Event) -> None:
+        if event.widget is not self.root or self.closing:
+            return
+        if self._fit_job is not None:
+            self.root.after_cancel(self._fit_job)
+        self._fit_job = self.root.after(200, self._sync_screen)
+
+    def _sync_screen(self) -> None:
+        self._fit_job = None
+        if self.closing:
+            return
+        try:
+            left, top, right, bottom, dpi = _monitor_of_window(self.root.winfo_id())
+        except Exception:
+            return
+        key = (left, top, dpi)
+        if key == self._screen_key:
+            self._sync_scroll()
+            return
+        self._screen_key = key
+        self._adopt_dpi(dpi, bottom - top)
+        if self.root.state() == "zoomed":
+            return
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        origin_x = self.root.winfo_x()
+        origin_y = self.root.winfo_y()
+        fitted_w = min(width, max(320, right - left - 8))
+        fitted_h = min(height, max(240, bottom - top - 8))
+        fitted_x = min(max(origin_x, left), right - fitted_w)
+        fitted_y = min(max(origin_y, top), bottom - fitted_h)
+        self.root.minsize(min(640, fitted_w), min(420, fitted_h))
+        if (fitted_w, fitted_h, fitted_x, fitted_y) != (width, height, origin_x, origin_y):
+            self.root.geometry(f"{int(fitted_w)}x{int(fitted_h)}+{int(fitted_x)}+{int(fitted_y)}")
+        self._sync_scroll()
 
     def _build_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -299,40 +479,109 @@ class App:
 
     def _build(self) -> None:
         header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=22, pady=(18, 8))
+        header.pack(fill="x", padx=18, pady=(14, 6))
         tk.Label(header, text="ALFA", bg=BG, fg=ACCENT, font=("Segoe UI Semibold", 12)).pack(anchor="w")
-        tk.Label(
+        self.title_label = tk.Label(
             header,
             text="Текстовая выгрузка в Excel",
             bg=BG,
             fg=TEXT,
             font=("Segoe UI Semibold", 22),
-        ).pack(anchor="w", pady=(2, 0))
-        tk.Label(
+        )
+        self.title_label.pack(anchor="w", pady=(2, 0))
+        subtitle = tk.Label(
             header,
             text="Файл или целая папка выгрузок. Книги из папки сохраняются рядом с исходными файлами.",
             bg=BG,
             fg=MUTED,
             font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(4, 0))
+            justify="left",
+            anchor="w",
+        )
+        subtitle.pack(anchor="w", fill="x", pady=(4, 0))
+        self._hints.append(subtitle)
 
-        body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=22, pady=(8, 0))
-        body.columnconfigure(0, weight=5)
-        body.columnconfigure(1, weight=6)
-        body.rowconfigure(1, weight=1)
+        middle = tk.Frame(self.root, bg=BG)
+        middle.pack(fill="both", expand=True)
+        self.vscroll = tk.Scrollbar(
+            middle,
+            orient="vertical",
+            command=lambda *args: self.viewport.yview(*args),
+            bg="#2c3142",
+            troughcolor=BG,
+            activebackground="#3c4258",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.viewport = tk.Canvas(middle, bg=BG, highlightthickness=0, bd=0, yscrollcommand=self._on_scroll)
+        self.viewport.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.viewport, bg=BG)
+        self.viewport_window = self.viewport.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.columnconfigure(0, weight=5)
+        self.body.columnconfigure(1, weight=6)
+        self.body.rowconfigure(1, weight=1)
+        self.body.bind("<Configure>", lambda _event: self._sync_scroll())
+        self.viewport.bind("<Configure>", self._on_viewport_configure)
+        self.viewport.bind("<MouseWheel>", self._on_wheel)
 
-        source = self._card(body)
-        source.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
-        preview = self._card(body)
-        preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
-        pipeline = self._card(body)
-        pipeline.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
-
-        self._build_source(source)
-        self._build_preview(preview)
-        self._build_pipeline(pipeline)
+        self.source_card = self._card(self.body)
+        self.preview_card = self._card(self.body)
+        self.pipeline_card = self._card(self.body)
+        self._build_source(self.source_card)
+        self._build_preview(self.preview_card)
+        self._build_pipeline(self.pipeline_card)
+        self._reflow(1100)
         self._build_actions()
+
+    def _on_viewport_configure(self, event: tk.Event) -> None:
+        self.viewport.itemconfigure(self.viewport_window, width=event.width)
+        self._reflow(event.width)
+        self._sync_scroll()
+
+    def _on_scroll(self, first: str, last: str) -> None:
+        self.vscroll.set(first, last)
+        if float(first) <= 0 and float(last) >= 1:
+            if self.vscroll.winfo_ismapped():
+                self.vscroll.pack_forget()
+        elif not self.vscroll.winfo_ismapped():
+            self.vscroll.pack(side="right", fill="y")
+
+    def _sync_scroll(self) -> None:
+        bbox = self.viewport.bbox("all")
+        if bbox:
+            self.viewport.configure(scrollregion=bbox)
+
+    def _on_wheel(self, event: tk.Event) -> None:
+        widget = event.widget
+        while widget is not None:
+            if widget in (getattr(self, "log", None), getattr(self, "tree", None)):
+                return
+            widget = getattr(widget, "master", None)
+        if self.vscroll.winfo_ismapped():
+            self.viewport.yview_scroll(int(-event.delta / 120), "units")
+
+    def _reflow(self, width: int) -> None:
+        stacked = width < 980
+        if stacked == self._stacked:
+            self._wrap_hints()
+            return
+        self._stacked = stacked
+        pad = 12
+        if stacked:
+            self.source_card.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(0, 8))
+            self.preview_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=pad, pady=8)
+            self.pipeline_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(8, 0))
+        else:
+            self.source_card.grid(row=0, column=0, sticky="nsew", padx=(pad, 6), pady=(0, 8))
+            self.preview_card.grid(row=0, column=1, sticky="nsew", padx=(6, pad), pady=(0, 8))
+            self.pipeline_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(8, 0))
+        self._wrap_hints()
+
+    def _wrap_hints(self) -> None:
+        for label in self._hints:
+            width = label.master.winfo_width()
+            if width > 48:
+                label.configure(wraplength=max(120, width - 8))
 
     def _card(self, parent: tk.Misc) -> tk.Frame:
         outer = tk.Frame(parent, bg=BORDER)
@@ -385,15 +634,17 @@ class App:
         pad = tk.Frame(card, bg=SURFACE)
         pad.pack(fill="both", expand=True, padx=16, pady=14)
         tk.Label(pad, text="Источник", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w")
-        tk.Label(
+        source_hint = tk.Label(
             pad,
             text="Один файл или папка целиком. Из папки берутся txt, rpt, csv, dat и bcp.",
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),
-            wraplength=460,
             justify="left",
-        ).pack(anchor="w", pady=(2, 10))
+            anchor="w",
+        )
+        source_hint.pack(anchor="w", fill="x", pady=(2, 10))
+        self._hints.append(source_hint)
 
         self.source_var = tk.StringVar()
         self.output_var = tk.StringVar()
@@ -452,15 +703,17 @@ class App:
         pad = tk.Frame(card, bg=SURFACE)
         pad.pack(fill="both", expand=True, padx=16, pady=14)
         tk.Label(pad, text="Книга и образец", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w")
-        tk.Label(
+        preview_hint = tk.Label(
             pad,
             text="Лист Excel вмещает 1 048 575 строк данных. Дальше начинается следующий файл.",
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),
-            wraplength=520,
             justify="left",
-        ).pack(anchor="w", pady=(2, 10))
+            anchor="w",
+        )
+        preview_hint.pack(anchor="w", fill="x", pady=(2, 10))
+        self._hints.append(preview_hint)
 
         self.output_caption = tk.Label(
             pad,
@@ -485,11 +738,11 @@ class App:
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),
-            wraplength=520,
             justify="left",
             anchor="w",
         )
         self.summary.pack(fill="x", pady=(0, 8))
+        self._hints.append(self.summary)
 
         tree_wrap = tk.Frame(pad, bg=BORDER)
         tree_wrap.pack(fill="both", expand=True)
@@ -548,8 +801,9 @@ class App:
         self.log.configure(state="disabled")
 
     def _build_actions(self) -> None:
-        bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=22, pady=16)
+        self.actions = tk.Frame(self.root, bg=BG)
+        self.actions.pack(fill="x", padx=18, pady=12)
+        bar = self.actions
         self.run_button = DarkButton(bar, "Собрать Excel", self._start, "accent")
         self.run_button.pack(side="right")
         self.stop_button = DarkButton(bar, "Стоп", self._stop, "danger")
@@ -981,6 +1235,10 @@ class App:
             os.startfile(folder)  # type: ignore[attr-defined]
 
     def _on_close(self) -> None:
+        if self._fit_job is not None:
+            self.root.after_cancel(self._fit_job)
+            self._fit_job = None
+        self.root.unbind_all("<MouseWheel>")
         if self.worker and self.worker.is_alive():
             self.cancel.set()
             self.closing = True
