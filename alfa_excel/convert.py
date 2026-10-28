@@ -60,6 +60,7 @@ class Layout:
     preview_header: list[str] = field(default_factory=list)
     sample: list[list[str]] = field(default_factory=list)
     allow_multiline_quotes: bool = False
+    locked_columns: int = 0
 
 
 @dataclass
@@ -152,6 +153,7 @@ def describe_delimiter(value: str) -> str:
         ",": "запятая",
         ";": "точка с запятой",
         "|": "вертикальная черта",
+        "\u00a0": "неразрывный пробел",
         "\r\n": "CRLF",
         "\n": "LF",
         "\r": "CR",
@@ -671,6 +673,51 @@ def _read_sample(path: str, encoding: str) -> str:
         source.close()
 
 
+_DELETE_INVISIBLE = str.maketrans("", "", "\u200b\u200c\u200d\ufeff\u2060\u180e\u00ad")
+_SPACE_LIKE = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u2000": " ",
+        "\u2001": " ",
+        "\u2002": " ",
+        "\u2003": " ",
+        "\u2004": " ",
+        "\u2005": " ",
+        "\u2006": " ",
+        "\u2007": " ",
+        "\u2008": " ",
+        "\u2009": " ",
+        "\u200a": " ",
+        "\u202f": " ",
+        "\u205f": " ",
+        "\u3000": " ",
+    }
+)
+_SPACE_LIKE_KEEP_NBSP = str.maketrans(
+    {key: " " for key in "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"}
+)
+_INVISIBLE_NAMES = {
+    "\u00a0": "неразрывный пробел",
+    "\u2007": "цифровой пробел",
+    "\u202f": "узкий пробел",
+    "\u200b": "пробел нулевой ширины",
+    "\u200c": "невидимый соединитель",
+    "\u200d": "невидимый соединитель",
+    "\ufeff": "метка BOM",
+    "\u2060": "неразрывный знак нулевой ширины",
+    "\u00ad": "мягкий перенос",
+}
+_SCAN_DELIMITERS = ("\t", ",", ";", "|", "\u00a0")
+
+
+def normalize_text(text: str, *, keep_nbsp: bool = False) -> str:
+    """Убирает невидимые символы. Неразрывный пробел остаётся, если это разделитель."""
+    if not text:
+        return text
+    text = text.translate(_DELETE_INVISIBLE)
+    return text.translate(_SPACE_LIKE_KEEP_NBSP if keep_nbsp else _SPACE_LIKE)
+
+
 def _normalize_names(names: list[str], synthetic: bool) -> list[str]:
     if synthetic or not names:
         width = max(1, len(names))
@@ -708,7 +755,10 @@ class RowStream:
             item = self._pushback
             self._pushback = None
             return item
-        return next(self.lines, None)
+        item = next(self.lines, None)
+        if isinstance(item, str):
+            return normalize_text(item, keep_nbsp=self.layout.delimiter == "\u00a0")
+        return item
 
     def _clean_fields(self, fields: list[str]) -> list[str]:
         if self.layout.delimiter == "\t" or not self.layout.delimiter:
@@ -772,6 +822,7 @@ class RowStream:
             self.header = _normalize_names(self.layout.column_names, False)
         else:
             self._prime_delimited()
+        self._lock_columns()
         if len(self.header) > 16384:
             raise ExportError("В строке больше 16 384 колонок. Столько лист Excel не принимает.")
 
@@ -799,12 +850,24 @@ class RowStream:
                 self.header = _normalize_names(self.layout.column_names, False)
                 self._pending = fit_width(fields, len(self.header), self.layout.delimiter, self.stats)
                 return
-            if self.layout.header_from_file:
+            if self.layout.header_from_file and (
+                not self.layout.locked_columns or len(fields) == self.layout.locked_columns
+            ):
                 self.header = _normalize_names(fields, False)
+                self._lock_columns()
                 return
-            self.header = [f"Колонка {index + 1}" for index in range(max(1, len(fields)))]
+            width = self.layout.locked_columns or max(1, len(fields))
+            self.header = [f"Колонка {index + 1}" for index in range(width)]
             self._pending = fit_width(fields, len(self.header), self.layout.delimiter, self.stats)
             return
+
+    def _lock_columns(self) -> None:
+        locked = self.layout.locked_columns
+        if locked <= 0 or not self.header:
+            return
+        if len(self.header) < locked:
+            start = len(self.header)
+            self.header.extend(f"Колонка {start + index + 1}" for index in range(locked - start))
 
     def _rows_delimited(self) -> Iterator[list[str]]:
         width = len(self.header)
@@ -1094,6 +1157,192 @@ def plan_folder(folder: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _quoted_mark(text: str, delimiter: str) -> int:
+    """Сколько разделителей снаружи кавычек. Запятая внутри поля не плодит колонку."""
+    if '"' not in text:
+        return text.count(delimiter)
+    fields, unclosed = parse_fields(text, delimiter, '"')
+    if unclosed:
+        return text.count(delimiter)
+    return max(0, len(fields) - 1)
+
+
+def _modal_split(counts: dict[int, int]) -> tuple[int, int, int]:
+    if not counts:
+        return 0, 0, 0
+    total = sum(counts.values())
+    positive = {count: lines for count, lines in counts.items() if count > 0}
+    if not positive:
+        return 0, 0, total
+    count, lines = max(positive.items(), key=lambda item: (item[1], item[0]))
+    return count, lines, total
+
+
+def _best_scanned_delimiter(hist: dict[str, dict[int, int]]) -> tuple[str, bool, int]:
+    best = "\t"
+    best_score = -1.0
+    best_fields = 0
+    sure = False
+    for delimiter, counts in hist.items():
+        mode_count, mode_lines, total = _modal_split(counts)
+        if mode_count < 1 or total <= 0:
+            continue
+        stability = mode_lines / total
+        if stability < 0.55:
+            continue
+        score = stability * 1000 + mode_count
+        if delimiter == "\t":
+            score += 5
+        if score > best_score:
+            best = delimiter
+            best_score = score
+            best_fields = mode_count + 1
+            sure = stability >= 0.8
+    return best, sure, best_fields
+
+
+def analyze_file(
+    path: str,
+    settings: Settings,
+    progress: Callable[[Progress], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> Layout:
+    """Первый проход: весь файл, в памяти только счётчики и несколько строк."""
+    if not os.path.isfile(path):
+        raise ExportError("Исходный файл не найден.")
+    encoding = resolve_encoding(path, settings.encoding)
+    if settings.mode == "fmt":
+        layout = layout_from_fmt(settings.fmt_path, encoding)
+        layout.notes.insert(0, f"Кодировка: {encoding}")
+        return layout
+
+    source = Source(path, encoding)
+    stats = Stats()
+    histogram: dict[str, dict[int, int]] = {delimiter: {} for delimiter in _SCAN_DELIMITERS}
+    invisible: dict[str, int] = {}
+    sample_lines: list[str] = []
+    previous = ""
+    dash_line = ""
+    seen = 0
+    try:
+        progress and progress(
+            Progress(stage="probe", fraction=0.01, message="Анализ файла", file_size=source.size)
+        )
+        for line in iter_lines(source.text, settings.max_line_chars, stats):
+            if line is SKIPPED:
+                continue
+            seen += 1
+            if cancelled and seen % PROGRESS_EVERY == 0 and cancelled():
+                raise Cancelled("Остановлено на анализе.")
+            raw = str(line)
+            for char, name in _INVISIBLE_NAMES.items():
+                amount = raw.count(char)
+                if amount:
+                    invisible[name] = invisible.get(name, 0) + amount
+            text = normalize_text(raw, keep_nbsp=True)
+            if seen % PROGRESS_EVERY == 0 and progress:
+                progress(
+                    Progress(
+                        stage="probe",
+                        fraction=_fraction(source.counter.read_bytes, source.size),
+                        message="Анализ разделителей и невидимых символов",
+                        rows=seen,
+                        bytes_read=source.counter.read_bytes,
+                        file_size=source.size,
+                    )
+                )
+            if is_noise(text):
+                previous = ""
+                continue
+            if not dash_line and seen <= 200 and dash_spans(text) is not None and previous.strip():
+                dash_line = text[:8000]
+            if dash_spans(text) is None:
+                if len(sample_lines) < 12 and len(text) <= 4000:
+                    sample_lines.append(text)
+                for delimiter, bucket in histogram.items():
+                    count = _quoted_mark(text, delimiter) if delimiter in {",", ";"} else text.count(delimiter)
+                    bucket[count] = bucket.get(count, 0) + 1
+            previous = text[:4000]
+    finally:
+        source.close()
+
+    notes = [f"Кодировка: {encoding}", f"Анализ всего файла: {_format_scan_rows(seen)} строк."]
+    for name, amount in invisible.items():
+        notes.append(f"Найден {name}: {amount}.")
+    if settings.mode in {"auto", "report"} and dash_line:
+        notes.append("Режим: отчёт sqlcmd / SSMS. Ширина колонок снята со строки дефисов во всём файле.")
+        synthetic = settings.header == "no"
+        if synthetic:
+            notes.append("Имена колонок заменены на «Колонка N».")
+        return Layout(
+            encoding=encoding,
+            mode="report",
+            synthetic_header=synthetic,
+            header_from_file=not synthetic,
+            notes=notes,
+        )
+    if settings.mode == "report":
+        raise ExportError("В файле нет строки из дефисов. Это не отчёт sqlcmd или SSMS.")
+
+    guessed, sure, fields = _best_scanned_delimiter(histogram)
+    delimiter = settings.delimiter if settings.delimiter not in {"", "auto"} else guessed
+    if settings.delimiter in {"", "auto"} and not sure:
+        notes.append("Разделитель по всему файлу неоднородный. Если колонки съедут, выберите его вручную.")
+    locked = 0
+    if delimiter in histogram:
+        mode_count, _lines, _total = _modal_split(histogram[delimiter])
+        if mode_count > 0:
+            locked = mode_count + 1
+    elif fields:
+        locked = fields
+
+    qualifier = settings.qualifier
+    multiline = settings.mode == "csv"
+    if settings.mode == "csv" and not qualifier:
+        qualifier = '"'
+    if settings.mode == "auto" and not qualifier and delimiter == ",":
+        use_quotes, _odd = looks_like_quoted_csv(sample_lines, delimiter)
+        if use_quotes:
+            qualifier = '"'
+    notes.append(f"Режим: текст с разделителем ({describe_delimiter(delimiter)}).")
+    if locked:
+        notes.append(f"Колонок по всему файлу: {locked}. Пустые поля сохраняются.")
+    if qualifier:
+        notes.append("Кавычки обрамляют поля." if not multiline else "Кавычки обрамляют поля, в том числе с переносом строки.")
+
+    header_from_file = settings.header == "yes"
+    if settings.header == "auto" and locked and sample_lines and not qualifier:
+        matching = [line for line in sample_lines if line.count(delimiter) + 1 == locked]
+        first_count = sample_lines[0].count(delimiter) + 1
+        if first_count == locked and len(matching) >= 2:
+            first = matching[0].split(delimiter)
+            second = matching[1].split(delimiter)
+            header_from_file = _looks_like_header(first, second)
+            notes.append(
+                "Первая подходящая строка принята за имена колонок."
+                if header_from_file
+                else "Имена колонок не найдены. Заголовки будут «Колонка N»."
+            )
+        else:
+            notes.append("Первая строка не задаёт колонки. Имена будут «Колонка N».")
+    elif settings.header == "no":
+        notes.append("Первая строка пойдёт в данные, без отдельной строки имён.")
+    return Layout(
+        encoding=encoding,
+        mode="delimited",
+        delimiter=delimiter,
+        qualifier=qualifier,
+        header_from_file=header_from_file,
+        allow_multiline_quotes=multiline,
+        locked_columns=locked,
+        notes=notes,
+    )
+
+
+def _format_scan_rows(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
 def inspect(path: str, settings: Settings) -> Layout:
     layout = build_layout(path, settings)
     stats = Stats()
@@ -1140,8 +1389,8 @@ def convert(
         raise ExportError("Кавычка и разделитель не должны совпадать.")
 
     started = time.perf_counter()
-    progress(Progress(stage="probe", fraction=0.2, message="Смотрю кодировку и формат"))
-    layout = build_layout(path, settings)
+    progress(Progress(stage="probe", fraction=0.02, message="Анализ всего файла"))
+    layout = analyze_file(path, settings, progress, cancelled)
     if cancelled():
         raise Cancelled("Остановлено.")
     progress(
@@ -1296,6 +1545,27 @@ def run_self_check() -> None:
 
     directory = tempfile.mkdtemp(prefix="alfa_excel_")
     try:
+        scan_path = os.path.join(directory, "scan.txt")
+        Path(scan_path).write_text(
+            "h1\u00a0h2\u00a0h3\n"
+            "1\u00a0\u00a02\n"
+            "3\u00a0x\u00a04\n"
+            "4\u00a0y\u00a05\n",
+            encoding="utf-8",
+        )
+        scanned = analyze_file(scan_path, Settings(mode="auto", delimiter="auto", header="yes"))
+        assert scanned.delimiter == "\u00a0", (scanned.delimiter, scanned.notes)
+        assert scanned.locked_columns == 3, scanned.locked_columns
+        assert any("неразрывный" in note for note in scanned.notes)
+        held = Source(scan_path, "utf-8")
+        try:
+            scan_stream = RowStream(iter_lines(held.text, 100000, Stats()), scanned, Settings(), Stats())
+            scan_stream.open()
+            scan_rows = list(scan_stream.rows())
+        finally:
+            held.close()
+        assert scan_rows[0] == ["1", "", "2"], scan_rows
+        assert scan_rows[1] == ["3", "x", "4"], scan_rows
         source = os.path.join(directory, "dump.txt")
         output = os.path.join(directory, "dump.xlsx")
         with open(source, "w", encoding="utf-8", newline="") as handle:
