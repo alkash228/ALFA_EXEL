@@ -270,6 +270,41 @@ class DarkButton(tk.Button):
         self.configure(state="normal" if enabled else "disabled", bg=self._bg if enabled else "#2a2d36")
 
 
+class WrapBar(tk.Frame):
+    """Кнопки в ряд, а если не влезают — переносятся на следующую строку."""
+
+    def __init__(self, parent: tk.Misc, bg: str) -> None:
+        super().__init__(parent, bg=bg)
+        self._widgets: list[tk.Widget] = []
+        self.bind("<Configure>", self._relayout)
+
+        self._last_width = 0
+
+    def add(self, widget: tk.Widget) -> None:
+        self._widgets.append(widget)
+        self._relayout()
+
+    def _relayout(self, event: tk.Event | None = None) -> None:
+        width = event.width if event is not None and event.width > 1 else self.winfo_width()
+        if width < 40 or abs(width - self._last_width) < 2:
+            return
+        self._last_width = width
+        for widget in self._widgets:
+            widget.grid_forget()
+        row = 0
+        column = 0
+        used = 0
+        for widget in self._widgets:
+            needed = widget.winfo_reqwidth() + 8
+            if column and used + needed > width:
+                row += 1
+                column = 0
+                used = 0
+            widget.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=3)
+            used += needed
+            column += 1
+
+
 class StageBar(tk.Frame):
     def __init__(self, parent: tk.Misc, title: str, caption: str, color: str) -> None:
         super().__init__(parent, bg=SURFACE)
@@ -280,11 +315,25 @@ class StageBar(tk.Frame):
         tk.Label(title_row, text=title, bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 10)).pack(side="left")
         self.percent = tk.Label(title_row, text="0%", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
         self.percent.pack(side="right")
-        self.caption = tk.Label(title_row, text=caption, bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
-        self.caption.pack(side="right", padx=(0, 12))
-        self.canvas = tk.Canvas(self, height=10, bg=SURFACE, highlightthickness=0, bd=0)
+        self.caption = tk.Label(
+            self,
+            text=caption,
+            bg=SURFACE,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=240,
+        )
+        self.caption.pack(fill="x", pady=(2, 0))
+        self.canvas = tk.Canvas(self, height=8, bg=SURFACE, highlightthickness=0, bd=0)
         self.canvas.pack(fill="x", pady=(6, 0))
+        self.bind("<Configure>", self._fit_caption)
         self.canvas.bind("<Configure>", lambda _event: self.redraw())
+
+    def _fit_caption(self, event: tk.Event) -> None:
+        if event.width > 20:
+            self.caption.configure(wraplength=event.width)
 
     def set(self, fraction: float, caption: str) -> None:
         self.fraction = max(0.0, min(1.0, fraction))
@@ -354,7 +403,7 @@ class App:
             left, top = 0, 0
             right, bottom = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
             dpi = self._dpi
-        self._adopt_dpi(dpi, bottom - top)
+        self._screen_key = (left, top, max(96, dpi))
         work_w = max(320, right - left)
         work_h = max(240, bottom - top)
         width = work_w - 24
@@ -367,7 +416,7 @@ class App:
         height = max(240, min(height, work_h - 8))
         x = left + max(0, (work_w - width) // 2)
         y = top + max(0, (work_h - height) // 2)
-        self.root.minsize(min(640, width), min(420, height))
+        self.root.minsize(min(520, width), min(360, height))
         if self.root.state() != "zoomed":
             self.root.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
         self._screen_key = (left, top, self._dpi)
@@ -409,8 +458,8 @@ class App:
             self._sync_scroll()
             return
         self._screen_key = key
-        self._adopt_dpi(dpi, bottom - top)
         if self.root.state() == "zoomed":
+            self._sync_scroll()
             return
         self.root.update_idletasks()
         width = self.root.winfo_width()
@@ -421,7 +470,7 @@ class App:
         fitted_h = min(height, max(240, bottom - top - 8))
         fitted_x = min(max(origin_x, left), right - fitted_w)
         fitted_y = min(max(origin_y, top), bottom - fitted_h)
-        self.root.minsize(min(640, fitted_w), min(420, fitted_h))
+        self.root.minsize(min(520, fitted_w), min(360, fitted_h))
         if (fitted_w, fitted_h, fitted_x, fitted_y) != (width, height, origin_x, origin_y):
             self.root.geometry(f"{int(fitted_w)}x{int(fitted_h)}+{int(fitted_x)}+{int(fitted_y)}")
         self._sync_scroll()
@@ -486,7 +535,10 @@ class App:
             text="Текстовая выгрузка в Excel",
             bg=BG,
             fg=TEXT,
-            font=("Segoe UI Semibold", 22),
+            font=("Segoe UI Semibold", 18),
+            justify="left",
+            anchor="w",
+            wraplength=280,
         )
         self.title_label.pack(anchor="w", pady=(2, 0))
         subtitle = tk.Label(
@@ -499,6 +551,7 @@ class App:
             anchor="w",
         )
         subtitle.pack(anchor="w", fill="x", pady=(4, 0))
+        self._hints.append(self.title_label)
         self._hints.append(subtitle)
 
         middle = tk.Frame(self.root, bg=BG)
@@ -561,27 +614,36 @@ class App:
             self.viewport.yview_scroll(int(-event.delta / 120), "units")
 
     def _reflow(self, width: int) -> None:
-        stacked = width < 980
+        scale = float(self.root.tk.call("tk", "scaling") or 1.3)
+        card_min = int(360 * scale)
+        stacked = width < card_min * 2 + 48
         if stacked == self._stacked:
-            self._wrap_hints()
+            self._wrap_hints(width)
             return
         self._stacked = stacked
         pad = 12
+        self.body.columnconfigure(0, weight=1, uniform="cards", minsize=0)
+        self.body.columnconfigure(1, weight=1, uniform="cards", minsize=0)
         if stacked:
-            self.source_card.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(0, 8))
-            self.preview_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=pad, pady=8)
-            self.pipeline_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(8, 0))
+            self.body.columnconfigure(1, weight=0, uniform="")
+            self.source_card.grid(row=0, column=0, columnspan=2, sticky="ew", padx=pad, pady=(8, 8))
+            self.preview_card.grid(row=1, column=0, columnspan=2, sticky="ew", padx=pad, pady=8)
+            self.pipeline_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=pad, pady=(8, 8))
         else:
-            self.source_card.grid(row=0, column=0, sticky="nsew", padx=(pad, 6), pady=(0, 8))
-            self.preview_card.grid(row=0, column=1, sticky="nsew", padx=(6, pad), pady=(0, 8))
-            self.pipeline_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(8, 0))
-        self._wrap_hints()
+            self.source_card.grid(row=0, column=0, columnspan=1, sticky="nsew", padx=(pad, 6), pady=(8, 8))
+            self.preview_card.grid(row=0, column=1, columnspan=1, sticky="nsew", padx=(6, pad), pady=(8, 8))
+            self.pipeline_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=pad, pady=(8, 8))
+        self._wrap_hints(width)
 
-    def _wrap_hints(self) -> None:
+    def _wrap_hints(self, width: int = 0) -> None:
+        limit = max(160, (width or self.viewport.winfo_width()) - 48)
+        if self._stacked:
+            each = limit
+        else:
+            each = max(160, (limit - 24) // 2)
         for label in self._hints:
-            width = label.master.winfo_width()
-            if width > 48:
-                label.configure(wraplength=max(120, width - 8))
+            parent_width = label.master.winfo_width()
+            label.configure(wraplength=max(140, parent_width - 8 if parent_width > 48 else each))
 
     def _card(self, parent: tk.Misc) -> tk.Frame:
         outer = tk.Frame(parent, bg=BORDER)
@@ -605,6 +667,7 @@ class App:
             highlightbackground=BORDER,
             highlightcolor=ACCENT,
             font=("Segoe UI", 10),
+            width=12,
             bd=6,
         )
 
@@ -620,6 +683,7 @@ class App:
             state="readonly",
             style="Dark.TCombobox",
             font=("Segoe UI", 10),
+            width=18,
         )
         variable.set(reverse[pairs[0][0]] if variable.get() not in reverse else reverse.get(variable.get(), labels[0]))
         if variable.get() not in labels:
@@ -642,6 +706,7 @@ class App:
             font=("Segoe UI", 9),
             justify="left",
             anchor="w",
+            wraplength=280,
         )
         source_hint.pack(anchor="w", fill="x", pady=(2, 10))
         self._hints.append(source_hint)
@@ -653,11 +718,11 @@ class App:
         self.rows_var = tk.StringVar(value="1000000")
 
         self._label(pad, "Файл или папка")
-        row = tk.Frame(pad, bg=SURFACE)
-        row.pack(fill="x", pady=(0, 8))
-        self._entry(row, self.source_var).pack(side="left", fill="x", expand=True, ipady=2)
-        DarkButton(row, "Файл", self._pick_source, "ghost").pack(side="left", padx=(8, 0))
-        DarkButton(row, "Папка", self._pick_folder, "ghost").pack(side="left", padx=(8, 0))
+        self._entry(pad, self.source_var).pack(fill="x", ipady=2)
+        source_buttons = WrapBar(pad, SURFACE)
+        source_buttons.pack(fill="x", pady=(6, 8))
+        source_buttons.add(DarkButton(source_buttons, "Файл", self._pick_source, "ghost"))
+        source_buttons.add(DarkButton(source_buttons, "Папка", self._pick_folder, "ghost"))
 
         self._label(pad, "Кодировка")
         self.encoding_var = tk.StringVar()
@@ -669,18 +734,13 @@ class App:
         self.mode_box = self._combo(pad, self.mode_var, MODES)
         tk.Frame(pad, bg=SURFACE, height=8).pack()
 
-        split = tk.Frame(pad, bg=SURFACE)
-        split.pack(fill="x")
-        left = tk.Frame(split, bg=SURFACE)
-        right = tk.Frame(split, bg=SURFACE)
-        left.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        right.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self._label(left, "Разделитель")
+        self._label(pad, "Разделитель")
         self.delim_var = tk.StringVar()
-        self.delim_box = self._combo(left, self.delim_var, DELIMITERS)
-        self._label(right, "Кавычки")
+        self.delim_box = self._combo(pad, self.delim_var, DELIMITERS)
+        tk.Frame(pad, bg=SURFACE, height=8).pack()
+        self._label(pad, "Кавычки")
         self.qual_var = tk.StringVar()
-        self.qual_box = self._combo(right, self.qual_var, QUALIFIERS)
+        self.qual_box = self._combo(pad, self.qual_var, QUALIFIERS)
         tk.Frame(pad, bg=SURFACE, height=8).pack()
 
         self._label(pad, "Свой разделитель, если выбран «Свой». Можно писать \\t, \\n и \\r")
@@ -693,10 +753,10 @@ class App:
         tk.Frame(pad, bg=SURFACE, height=8).pack()
 
         self._label(pad, "Форматный файл .fmt — только для режима «Форматный файл bcp»")
-        fmt_row = tk.Frame(pad, bg=SURFACE)
-        fmt_row.pack(fill="x")
-        self._entry(fmt_row, self.fmt_var).pack(side="left", fill="x", expand=True, ipady=2)
-        DarkButton(fmt_row, "FMT", self._pick_fmt, "ghost").pack(side="left", padx=(8, 0))
+        self._entry(pad, self.fmt_var).pack(fill="x", ipady=2)
+        fmt_buttons = WrapBar(pad, SURFACE)
+        fmt_buttons.pack(fill="x", pady=(6, 0))
+        fmt_buttons.add(DarkButton(fmt_buttons, "FMT", self._pick_fmt, "ghost"))
 
     def _build_preview(self, outer: tk.Frame) -> None:
         card = outer.inner  # type: ignore[attr-defined]
@@ -711,6 +771,7 @@ class App:
             font=("Segoe UI", 9),
             justify="left",
             anchor="w",
+            wraplength=280,
         )
         preview_hint.pack(anchor="w", fill="x", pady=(2, 10))
         self._hints.append(preview_hint)
@@ -722,11 +783,12 @@ class App:
             fg=MUTED,
             font=("Segoe UI", 9),
         )
-        self.output_caption.pack(anchor="w", pady=(0, 4))
-        out_row = tk.Frame(pad, bg=SURFACE)
-        out_row.pack(fill="x", pady=(0, 8))
-        self._entry(out_row, self.output_var).pack(side="left", fill="x", expand=True, ipady=2)
-        DarkButton(out_row, "Обзор", self._pick_output, "ghost").pack(side="left", padx=(8, 0))
+        self.output_caption.pack(anchor="w", fill="x", pady=(0, 4))
+        self._hints.append(self.output_caption)
+        self._entry(pad, self.output_var).pack(fill="x", ipady=2, pady=(0, 6))
+        output_buttons = WrapBar(pad, SURFACE)
+        output_buttons.pack(fill="x", pady=(0, 8))
+        output_buttons.add(DarkButton(output_buttons, "Обзор", self._pick_output, "ghost"))
 
         self._label(pad, "Строк данных в одном файле")
         self._entry(pad, self.rows_var).pack(fill="x", ipady=2)
@@ -744,11 +806,12 @@ class App:
         self.summary.pack(fill="x", pady=(0, 8))
         self._hints.append(self.summary)
 
-        tree_wrap = tk.Frame(pad, bg=BORDER)
+        tree_wrap = tk.Frame(pad, bg=BORDER, height=168)
         tree_wrap.pack(fill="both", expand=True)
+        tree_wrap.pack_propagate(False)
         inner = tk.Frame(tree_wrap, bg=INPUT)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
-        self.tree = ttk.Treeview(inner, show="headings", height=7, style="Preview.Treeview")
+        self.tree = ttk.Treeview(inner, show="headings", height=6, style="Preview.Treeview")
         scroll_y = ttk.Scrollbar(inner, orient="vertical", command=self.tree.yview)
         scroll_x = ttk.Scrollbar(inner, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
@@ -759,24 +822,37 @@ class App:
         inner.columnconfigure(0, weight=1)
         self.tree["columns"] = ("empty",)
         self.tree.heading("empty", text="Образец")
-        self.tree.column("empty", width=240, anchor="w")
+        self.tree.column("empty", width=120, minwidth=48, stretch=True, anchor="w")
 
     def _build_pipeline(self, outer: tk.Frame) -> None:
         card = outer.inner  # type: ignore[attr-defined]
         pad = tk.Frame(card, bg=SURFACE)
         pad.pack(fill="both", expand=True, padx=16, pady=14)
-        top = tk.Frame(pad, bg=SURFACE)
-        top.pack(fill="x")
-        tk.Label(top, text="Ход работы", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="left")
-        self.status = tk.Label(top, text="Ожидание", bg=SURFACE, fg=ACCENT, font=("Segoe UI", 10))
-        self.status.pack(side="right")
-        tk.Label(
+        tk.Label(pad, text="Ход работы", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w")
+        self.status = tk.Label(
+            pad,
+            text="Ожидание",
+            bg=SURFACE,
+            fg=ACCENT,
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=280,
+        )
+        self.status.pack(fill="x", pady=(2, 0))
+        self._hints.append(self.status)
+        pace = tk.Label(
             pad,
             text="Один проход: строка читается, разбирается, превращается в ячейки и сразу пишется.",
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),
-        ).pack(anchor="w", pady=(2, 10))
+            anchor="w",
+            justify="left",
+            wraplength=280,
+        )
+        pace.pack(anchor="w", fill="x", pady=(2, 10))
+        self._hints.append(pace)
         self.bars: dict[str, StageBar] = {}
         for key, title, caption, color in STAGES:
             bar = StageBar(pad, title, caption, color)
@@ -801,17 +877,15 @@ class App:
         self.log.configure(state="disabled")
 
     def _build_actions(self) -> None:
-        self.actions = tk.Frame(self.root, bg=BG)
+        self.actions = WrapBar(self.root, BG)
         self.actions.pack(fill="x", padx=18, pady=12)
-        bar = self.actions
-        self.run_button = DarkButton(bar, "Собрать Excel", self._start, "accent")
-        self.run_button.pack(side="right")
-        self.stop_button = DarkButton(bar, "Стоп", self._stop, "danger")
-        self.stop_button.pack(side="right", padx=(0, 8))
+        self.probe_button = DarkButton(self.actions, "Разобрать образец", self._probe, "ghost")
+        self.stop_button = DarkButton(self.actions, "Стоп", self._stop, "danger")
+        self.run_button = DarkButton(self.actions, "Собрать Excel", self._start, "accent")
+        folder_button = DarkButton(self.actions, "Открыть папку", self._open_folder, "ghost")
         self.stop_button.set_enabled(False)
-        self.probe_button = DarkButton(bar, "Разобрать образец", self._probe, "ghost")
-        self.probe_button.pack(side="right", padx=(0, 8))
-        DarkButton(bar, "Открыть папку", self._open_folder, "ghost").pack(side="left")
+        for button in (folder_button, self.probe_button, self.stop_button, self.run_button):
+            self.actions.add(button)
 
     def _pick_source(self) -> None:
         path = filedialog.askopenfilename(
@@ -966,13 +1040,13 @@ class App:
         if not header:
             self.tree["columns"] = ("empty",)
             self.tree.heading("empty", text="Пусто")
-            self.tree.column("empty", width=240, anchor="w")
+            self.tree.column("empty", width=120, minwidth=48, stretch=True, anchor="w")
             return
         columns = [f"c{index}" for index in range(len(header))]
         self.tree["columns"] = columns
         for column, name in zip(columns, header):
             self.tree.heading(column, text=name)
-            self.tree.column(column, width=max(90, min(220, 12 * len(name) + 24)), minwidth=80, stretch=False, anchor="w")
+            self.tree.column(column, width=140, minwidth=48, stretch=True, anchor="w")
         for row in rows:
             values = list(row) + [""] * (len(header) - len(row))
             self.tree.insert("", "end", values=values[: len(header)])
