@@ -59,6 +59,7 @@ class Layout:
     notes: list[str] = field(default_factory=list)
     preview_header: list[str] = field(default_factory=list)
     sample: list[list[str]] = field(default_factory=list)
+    allow_multiline_quotes: bool = False
 
 
 @dataclass
@@ -370,10 +371,17 @@ def is_noise(line: str) -> bool:
     return False
 
 
-def dash_spans(line: str) -> list[tuple[int, int]] | None:
+def dash_spans(line: str) -> list[tuple[int, int | None]] | None:
+    """Границы колонок отчёта sqlcmd/SSMS.
+
+    Пробел между группами дефисов относится к левой колонке: пустое поле
+    остаётся пустым и не сдвигает соседей влево. Последняя колонка идёт
+    до конца строки, чтобы длинное значение не обрезалось и не слипалось
+    со следующей. Колонка шириной в один символ тоже учитывается.
+    """
     if not line or any(char not in " \t-" for char in line):
         return None
-    spans: list[tuple[int, int]] = []
+    runs: list[tuple[int, int]] = []
     index = 0
     length = len(line)
     while index < length:
@@ -381,21 +389,62 @@ def dash_spans(line: str) -> list[tuple[int, int]] | None:
             end = index + 1
             while end < length and line[end] == "-":
                 end += 1
-            if end - index >= 2:
-                spans.append((index, end))
+            runs.append((index, end))
             index = end
         else:
             index += 1
-    if not spans:
+    if not runs:
         return None
+    longest = max(end - start for start, end in runs)
+    if longest < 2 and len(runs) < 2:
+        return None
+    spans: list[tuple[int, int | None]] = []
+    for position, (start, _end) in enumerate(runs):
+        if position + 1 < len(runs):
+            spans.append((start, runs[position + 1][0]))
+        else:
+            spans.append((start, None))
     return spans
 
 
-def slice_spans(line: str, spans: list[tuple[int, int]]) -> list[str]:
+def slice_spans(line: str, spans: list[tuple[int, int | None]]) -> list[str]:
     fields: list[str] = []
     for start, end in spans:
-        fields.append(line[start:end].strip() if start < len(line) else "")
+        if start >= len(line):
+            fields.append("")
+            continue
+        piece = line[start:] if end is None else line[start:end]
+        fields.append(piece.strip(" \t"))
     return fields
+
+
+_WRAP_WIDTHS = {80, 100, 120, 132, 160, 200, 240, 256, 512, 1024, 2048, 4096, 8192, 16384, 32767, 65535}
+
+
+def looks_like_quoted_csv(lines: list[str], delimiter: str) -> tuple[bool, bool]:
+    """Кавычки считаются квалификатором, только если они обрамляют поля.
+
+    Случайная кавычка внутри значения не должна склеивать хвост строки
+    и следующую запись.
+    """
+    if not delimiter:
+        return False, False
+    pattern = re.compile(
+        rf'(?:^|{re.escape(delimiter)})"(?:[^"]|"")*"(?={re.escape(delimiter)}|$)'
+    )
+    framed = 0
+    bare = 0
+    odd_lines = 0
+    for line in lines[:40]:
+        if line.count('"') % 2 == 1:
+            odd_lines += 1
+        found = len(pattern.findall(line))
+        if found:
+            framed += found
+        elif '"' in line:
+            bare += 1
+    use_quotes = framed >= 1 and framed >= bare
+    return use_quotes, use_quotes and odd_lines >= 1
 
 
 def parse_fields(text: str, delimiter: str, qualifier: str) -> tuple[list[str], bool]:
@@ -556,13 +605,22 @@ def decide(sample: str, settings: Settings, encoding: str) -> Layout:
         if not sure:
             notes.append("Разделитель угадан неуверенно. Если колонки съехали, выберите его вручную.")
     qualifier = settings.qualifier
+    multiline = False
     if settings.mode == "csv" and not qualifier:
         qualifier = '"'
-    if settings.mode == "auto" and delimiter == "," and sample.count('"') >= 2:
-        qualifier = '"'
+        multiline = True
+    if settings.mode == "auto" and not qualifier and delimiter == ",":
+        content_lines = [line for line in lines if line.strip() and dash_spans(line) is None][:40]
+        use_quotes, _odd_quotes = looks_like_quoted_csv(content_lines, delimiter)
+        if use_quotes:
+            qualifier = '"'
     notes.append(f"Режим: текст с разделителем ({describe_delimiter(delimiter)}).")
     if qualifier:
-        notes.append(f"Текстовый квалификатор: {qualifier}")
+        notes.append(
+            "Кавычки обрамляют поля."
+            if not multiline
+            else "Кавычки обрамляют поля, в том числе с переносом строки."
+        )
 
     content = [line for line in lines if line.strip()][:2]
     header_from_file = settings.header == "yes"
@@ -582,6 +640,7 @@ def decide(sample: str, settings: Settings, encoding: str) -> Layout:
         delimiter=delimiter,
         qualifier=qualifier,
         header_from_file=header_from_file,
+        allow_multiline_quotes=multiline,
         notes=notes,
     )
 
@@ -638,8 +697,73 @@ class RowStream:
         self.header: list[str] = []
         self.restart = False
         self._pending: list[str] | None = None
-        self._spans: list[tuple[int, int]] | None = None
+        self._spans: list[tuple[int, int | None]] | None = None
+        self._row_width = 0
+        self._wrap_chunks: tuple[str, ...] = ()
+        self._pushback: object | None = None
         self._report_started = False
+
+    def _pull(self) -> object | None:
+        if self._pushback is not None:
+            item = self._pushback
+            self._pushback = None
+            return item
+        return next(self.lines, None)
+
+    def _clean_fields(self, fields: list[str]) -> list[str]:
+        if self.layout.delimiter == "\t" or not self.layout.delimiter:
+            return fields
+        return [field.strip(" \t") for field in fields]
+
+    def _split_record(self, text: str) -> tuple[list[str], bool]:
+        delimiter = self.layout.delimiter
+        qualifier = self.layout.qualifier
+        if not qualifier:
+            return self._clean_fields(text.split(delimiter)), False
+        fields, unclosed = parse_fields(text, delimiter, qualifier)
+        if unclosed and not self.layout.allow_multiline_quotes:
+            return self._clean_fields(text.split(delimiter)), False
+        return self._clean_fields(fields), unclosed
+
+    def _join_dash_line(self, first: str) -> str:
+        parts = [first]
+        while True:
+            nxt = self._pull()
+            if nxt is None or nxt is SKIPPED:
+                break
+            text = str(nxt)
+            if dash_spans(text) is None:
+                self._pushback = nxt
+                break
+            parts.append(text)
+        self._wrap_chunks = tuple(parts)
+        joined = "".join(parts)
+        self._row_width = len(joined)
+        spans = dash_spans(joined)
+        return joined if spans else first
+
+    def _unwrap_data_line(self, text: str) -> str:
+        if len(self._wrap_chunks) < 2 or self._row_width <= 0 or len(text) >= self._row_width:
+            return text
+        if len(text) not in _WRAP_WIDTHS or text.endswith(" "):
+            return text
+        parts = [text]
+        while len("".join(parts)) < self._row_width:
+            nxt = self._pull()
+            if nxt is None or nxt is SKIPPED:
+                break
+            nxt_text = str(nxt)
+            if (
+                is_noise(nxt_text)
+                or dash_spans(nxt_text) is not None
+                or len(nxt_text) >= self._row_width
+            ):
+                self._pushback = nxt
+                break
+            parts.append(nxt_text)
+            if len(nxt_text) not in _WRAP_WIDTHS:
+                break
+        return "".join(parts)
 
     def open(self) -> None:
         if self.layout.mode == "report":
@@ -661,13 +785,13 @@ class RowStream:
 
     def _prime_delimited(self) -> None:
         while True:
-            line = next(self.lines, None)
+            line = self._pull()
             if line is None:
                 self.header = _normalize_names(self.layout.column_names, not self.layout.column_names)
                 return
             if line is SKIPPED or line == "":
                 continue
-            fields, unclosed = parse_fields(str(line), self.layout.delimiter, self.layout.qualifier)
+            fields, unclosed = self._split_record(str(line))
             if unclosed:
                 raise ExportError("В образце не закрыта кавычка. Проверьте квалификатор текста.")
             fields = _strip_mark(fields)
@@ -689,46 +813,49 @@ class RowStream:
             self._pending = None
             yield pending
         carry: str | None = None
-        qualifier = self.layout.qualifier
         delimiter = self.layout.delimiter
-        for line in self.lines:
+        while True:
+            line = self._pull()
+            if line is None:
+                break
             if line is SKIPPED:
                 continue
             if line == "" and carry is None:
                 continue
-            text = str(line)
-            if qualifier:
-                piece = text if carry is None else carry + "\n" + text
-                if len(piece) > self.settings.max_line_chars:
-                    self.stats.skipped_long += 1
-                    carry = None
-                    continue
-                fields, unclosed = parse_fields(piece, delimiter, qualifier)
-                if unclosed:
-                    carry = piece
-                    continue
+            text = str(line) if carry is None else carry + "\n" + str(line)
+            if len(text) > self.settings.max_line_chars:
+                self.stats.skipped_long += 1
                 carry = None
-            else:
-                fields = text.split(delimiter)
+                continue
+            fields, unclosed = self._split_record(text)
+            if unclosed:
+                carry = text
+                continue
+            carry = None
             yield fit_width(fields, width, delimiter, self.stats)
         if carry:
-            fields, _unclosed = parse_fields(carry, delimiter, qualifier)
+            fields = self._clean_fields(carry.split(delimiter))
             self.stats.ragged += 1
             yield fit_width(fields, width, delimiter, self.stats)
 
     def _prime_report(self) -> None:
         previous = ""
-        for line in self.lines:
+        while True:
+            line = self._pull()
+            if line is None:
+                break
             if line is SKIPPED:
                 previous = ""
                 continue
             text = str(line)
-            spans = dash_spans(text)
-            if spans and previous.strip() and not is_noise(previous):
-                names = slice_spans(previous, spans)
+            if dash_spans(text) is not None and previous.strip() and not is_noise(previous):
+                spans = dash_spans(self._join_dash_line(text))
+                if not spans:
+                    previous = ""
+                    continue
                 self._spans = spans
                 self._report_started = True
-                self.header = _normalize_names(names, self.layout.synthetic_header)
+                self.header = _normalize_names(slice_spans(previous, spans), self.layout.synthetic_header)
                 return
             if is_noise(text):
                 previous = ""
@@ -740,21 +867,25 @@ class RowStream:
         # Строка держится до следующей: повтор заголовка sqlcmd не должен
         # попасть в данные, а в constant_memory уже записанную строку не стереть.
         held: str | None = None
-        for line in self.lines:
+        while True:
+            line = self._pull()
+            if line is None:
+                break
             if line is SKIPPED:
                 continue
             text = str(line)
-            spans = dash_spans(text)
-            if spans and held is not None and held.strip() and not is_noise(held):
-                names = _normalize_names(slice_spans(held, spans), self.layout.synthetic_header)
-                self._spans = spans
-                if names != self.header:
-                    self.header = names
-                    self.restart = True
+            if dash_spans(text) is not None and held is not None and held.strip() and not is_noise(held):
+                spans = dash_spans(self._join_dash_line(text))
+                if spans:
+                    names = _normalize_names(slice_spans(held, spans), self.layout.synthetic_header)
+                    self._spans = spans
+                    if names != self.header:
+                        self.header = names
+                        self.restart = True
                 held = None
                 continue
             if held is not None and self._spans is not None and not is_noise(held):
-                yield slice_spans(held, self._spans)
+                yield slice_spans(self._unwrap_data_line(held), self._spans)
             held = None
             if is_noise(text):
                 if text.strip():
@@ -762,7 +893,7 @@ class RowStream:
                 continue
             held = text
         if held is not None and self._spans is not None and not is_noise(held):
-            yield slice_spans(held, self._spans)
+            yield slice_spans(self._unwrap_data_line(held), self._spans)
 
     def _rows_fixed(self) -> Iterator[list[str]]:
         widths = self.layout.widths
@@ -1142,11 +1273,25 @@ def run_self_check() -> None:
     assert parse_fields("1\t\t3", "\t", "") == (["1", "", "3"], False)
 
     spans = dash_spans("--   ----")
-    assert spans == [(0, 2), (5, 9)]
+    assert spans == [(0, 5), (5, None)]
     assert slice_spans("1    Ann", spans) == ["1", "Ann"]
+    assert slice_spans("1       Kazan", dash_spans("-- ---- ----")) == ["1", "", "Kazan"]
+    narrow = dash_spans("- ----")
+    assert narrow is not None and len(narrow) == 2
+    assert slice_spans("1 Ann", narrow) == ["1", "Ann"]
     assert form_value("00123", Stats()) == "00123"
     assert form_value("42", Stats()) == 42
     assert form_value("", Stats()) is None
+    quote_text = 'a,b,c\n1,"x,y",3\n4,"5,6,7\n8,9,0\n'
+    quote_layout = decide(quote_text, Settings(mode="auto", delimiter=",", header="yes"), "utf-8")
+    assert quote_layout.qualifier == '"'
+    assert quote_layout.allow_multiline_quotes is False
+    quote_stream = RowStream(iter(quote_text.splitlines()), quote_layout, Settings(), Stats())
+    quote_stream.open()
+    quote_rows = list(quote_stream.rows())
+    assert quote_rows[0] == ["1", "x,y", "3"], quote_rows
+    assert quote_rows[1][0] == "4"
+    assert quote_rows[2] == ["8", "9", "0"], quote_rows
     assert form_value("1998-08-12 00:00:00.000", Stats()) == dt.datetime(1998, 8, 12, 0, 0, 0)
 
     directory = tempfile.mkdtemp(prefix="alfa_excel_")
